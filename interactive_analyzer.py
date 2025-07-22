@@ -22,9 +22,6 @@ def main_menu():
         print("3. 查询特定月份")
         print("4. 查询特定年份")
         print("5. 显示详细汇总")
-        print("6. 列出所有日期")
-        print("7. 原合约优化分析")
-        print("8. 生成月度原合约曲线")
         print("0. 退出")
         print("-"*40)
         
