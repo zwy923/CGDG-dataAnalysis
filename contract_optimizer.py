@@ -148,19 +148,32 @@ class ContractOptimizer:
     def calculate_total_revenue(self, df, original_contract):
         """计算总收入"""
         try:
-            price_cols = self.find_price_columns(df)
-            volume_cols = self.find_volume_columns(df)
+            # 查找各项收益列
+            revenue_columns = {}
             
-            if 'contract_price' not in price_cols or 'forward_price' not in price_cols:
-                print("未找到必要的电价列")
+            for col in df.columns:
+                col_str = str(col).lower()
+                if '合约收益' in col_str:
+                    revenue_columns['contract_revenue'] = col
+                elif '撮合收益' in col_str:
+                    revenue_columns['matching_revenue'] = col
+                elif '日前结算收益' in col_str:
+                    revenue_columns['forward_settlement_revenue'] = col
+                elif '实时结算收益' in col_str:
+                    revenue_columns['realtime_settlement_revenue'] = col
+                elif '省间现货收益' in col_str:
+                    revenue_columns['interprovincial_revenue'] = col
+            
+            # 计算总收入：各项收益相加
+            total_revenue = pd.Series(0.0, index=df.index)
+            
+            for revenue_type, col_name in revenue_columns.items():
+                revenue_values = pd.to_numeric(df[col_name], errors='coerce').fillna(0)
+                total_revenue += revenue_values
+            
+            if len(revenue_columns) == 0:
+                print("警告：未找到任何收益列")
                 return None
-            
-            # 转换为数值
-            contract_prices = pd.to_numeric(df[price_cols['contract_price']], errors='coerce')
-            forward_prices = pd.to_numeric(df[price_cols['forward_price']], errors='coerce')
-            
-            # 计算总收入：原合约*合约电价 - 原合约*日前电价
-            total_revenue = original_contract * contract_prices - original_contract * forward_prices
             
             return total_revenue
             
@@ -205,67 +218,74 @@ class ContractOptimizer:
                 print("警告：电价数据全部无效")
                 return None, None
             
-            # 计算价格差 (收益系数)
-            price_diff = contract_prices - forward_prices
+            # 计算合约收益系数 (合约电价 - 日前电价)
+            # 注意：只有合约收益部分与原合约值直接相关
+            contract_revenue_coefficient = contract_prices - forward_prices
             
             # 处理无效值：将NaN、inf替换为0
-            price_diff = price_diff.fillna(0)
-            price_diff = price_diff.replace([np.inf, -np.inf], 0)
+            contract_revenue_coefficient = contract_revenue_coefficient.fillna(0)
+            contract_revenue_coefficient = contract_revenue_coefficient.replace([np.inf, -np.inf], 0)
             
             # 检查处理后的数据
-            if len(price_diff) == 0:
-                print("警告：没有有效的价格差数据")
+            if len(contract_revenue_coefficient) == 0:
+                print("警告：没有有效的合约收益系数数据")
                 return None, None
             
-            # 如果没有设置总量限制，使用原来的简单方法
+            # 如果没有设置总量限制，需要提示用户输入
             if self.daily_total_limit is None:
-                optimal_contract = np.where(price_diff > 0, self.contract_range[1], self.contract_range[0])
-                optimal_revenue = optimal_contract * price_diff
-                return optimal_contract, optimal_revenue
+                print("警告：等式约束优化需要设置每日总量限制")
+                return None, None
             
             # 有总量约束的优化
-            n_points = len(price_diff)
+            n_points = len(contract_revenue_coefficient)
             
-            # 目标函数：最大化总收益 (linprog默认最小化，所以取负数)
-            c = -price_diff.values
+            # 目标函数：最大化合约收益部分 (linprog默认最小化，所以取负数)
+            c = -contract_revenue_coefficient.values
             
             # 再次检查目标函数系数
             if np.any(~np.isfinite(c)):
-                return self._greedy_optimization(price_diff)
+                return self._greedy_optimization_with_equality(contract_revenue_coefficient, df)
             
             # 约束条件
-            # 1. 总量约束：sum(x) <= daily_total_limit
-            A_ub = np.ones((1, n_points))
-            b_ub = np.array([self.daily_total_limit])
+            # 1. 总量约束：sum(x) = daily_total_limit (等式约束)
+            A_eq = np.ones((1, n_points))
+            b_eq = np.array([self.daily_total_limit])
             
             # 2. 变量边界：0 <= x <= 12
             bounds = [(self.contract_range[0], self.contract_range[1]) for _ in range(n_points)]
             
             # 求解线性规划问题
             try:
-                result = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+                result = linprog(c, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
                 
                 if result.success:
                     optimal_contract = result.x
-                    optimal_revenue = optimal_contract * price_diff
-                    return optimal_contract, optimal_revenue
+                    
+                    # 计算完整的总收益
+                    total_revenue = self.calculate_total_revenue_for_contract(df, optimal_contract)
+                    
+                    return optimal_contract, total_revenue
                 else:
-                    return self._greedy_optimization(price_diff)
+                    return self._greedy_optimization_with_equality(contract_revenue_coefficient, df)
                     
             except Exception as lp_error:
-                return self._greedy_optimization(price_diff)
+                return self._greedy_optimization_with_equality(contract_revenue_coefficient, df)
                 
         except Exception as e:
             print(f"优化原合约时出错: {e}")
             try:
-                # 尝试计算简单的价格差
+                # 尝试计算简单的合约收益系数
                 price_cols = self.find_price_columns(df)
                 if 'contract_price' in price_cols and 'forward_price' in price_cols:
                     contract_prices = pd.to_numeric(df[price_cols['contract_price']], errors='coerce')
                     forward_prices = pd.to_numeric(df[price_cols['forward_price']], errors='coerce')
-                    price_diff = (contract_prices - forward_prices).fillna(0)
-                    price_diff = price_diff.replace([np.inf, -np.inf], 0)
-                    return self._greedy_optimization(price_diff)
+                    contract_revenue_coefficient = (contract_prices - forward_prices).fillna(0)
+                    contract_revenue_coefficient = contract_revenue_coefficient.replace([np.inf, -np.inf], 0)
+                    if self.daily_total_limit is not None:
+                        return self._greedy_optimization_with_equality(contract_revenue_coefficient, df)
+                    else:
+                        # 对于没有总量限制的情况，使用简单的贪心算法
+                        return self._greedy_optimization(contract_revenue_coefficient)
                 else:
                     return None, None
             except Exception as fallback_error:
@@ -312,6 +332,111 @@ class ContractOptimizer:
             print(f"贪心算法失败: {e}")
             return None, None
     
+    def _greedy_optimization_with_equality(self, contract_revenue_coefficient, df=None):
+        """贪心算法优化，确保总量严格等于限制值"""
+        try:
+            n_points = len(contract_revenue_coefficient)
+            optimal_contract = np.zeros(n_points)
+            target_total = self.daily_total_limit
+            
+            # 确保contract_revenue_coefficient是有效的数值
+            if hasattr(contract_revenue_coefficient, 'values'):
+                coeff_values = contract_revenue_coefficient.values
+            else:
+                coeff_values = np.array(contract_revenue_coefficient)
+            
+            # 处理无效值
+            coeff_values = np.nan_to_num(coeff_values, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # 检查是否可能达到目标总量
+            max_possible = n_points * self.contract_range[1]  # 96 * 12 = 1152
+            if target_total > max_possible:
+                print(f"警告：目标总量 {target_total} 超过最大可能值 {max_possible}")
+                # 按比例分配到所有时间点
+                optimal_contract = np.full(n_points, self.contract_range[1])
+                if df is not None:
+                    optimal_revenue = self.calculate_total_revenue_for_contract(df, optimal_contract)
+                else:
+                    optimal_revenue = optimal_contract * coeff_values
+                return optimal_contract, optimal_revenue
+            
+            # 按合约收益系数排序，优先分配给收益最高的时间点
+            sorted_indices = np.argsort(-coeff_values)  # 降序排列
+            remaining_total = target_total
+            
+            # 第一阶段：尽可能分配给正收益的时间点
+            for idx in sorted_indices:
+                if remaining_total <= 0:
+                    break
+                if coeff_values[idx] > 0:  # 优先分配给正收益
+                    allocate = min(self.contract_range[1], remaining_total)
+                    optimal_contract[idx] = allocate
+                    remaining_total -= allocate
+            
+            # 第二阶段：如果还有剩余，分配给收益最高的时间点（包括负收益）
+            if remaining_total > 0:
+                for idx in sorted_indices:
+                    if remaining_total <= 0:
+                        break
+                    available_capacity = self.contract_range[1] - optimal_contract[idx]
+                    if available_capacity > 0:
+                        allocate = min(available_capacity, remaining_total)
+                        optimal_contract[idx] += allocate
+                        remaining_total -= allocate
+            
+            # 第三阶段：如果总量不够，需要从某些时间点减少分配
+            if remaining_total < 0:
+                # 从收益最低的时间点开始减少
+                excess = -remaining_total
+                for idx in reversed(sorted_indices):
+                    if excess <= 0:
+                        break
+                    reduction = min(optimal_contract[idx], excess)
+                    optimal_contract[idx] -= reduction
+                    excess -= reduction
+            
+            # 确保总量严格等于目标值
+            current_total = np.sum(optimal_contract)
+            if abs(current_total - target_total) > 1e-6:
+                # 进行微调
+                diff = target_total - current_total
+                if diff > 0:
+                    # 需要增加，找到可以增加的时间点
+                    for idx in sorted_indices:
+                        if diff <= 0:
+                            break
+                        available = self.contract_range[1] - optimal_contract[idx]
+                        if available > 0:
+                            add_amount = min(available, diff)
+                            optimal_contract[idx] += add_amount
+                            diff -= add_amount
+                else:
+                    # 需要减少，找到可以减少的时间点
+                    diff = -diff
+                    for idx in reversed(sorted_indices):
+                        if diff <= 0:
+                            break
+                        if optimal_contract[idx] > 0:
+                            reduce_amount = min(optimal_contract[idx], diff)
+                            optimal_contract[idx] -= reduce_amount
+                            diff -= reduce_amount
+            
+            # 计算完整的总收益
+            if df is not None:
+                optimal_revenue = self.calculate_total_revenue_for_contract(df, optimal_contract)
+            else:
+                # 如果没有df，只计算合约收益部分
+                if hasattr(contract_revenue_coefficient, 'index'):
+                    optimal_revenue = optimal_contract * contract_revenue_coefficient.fillna(0)
+                else:
+                    optimal_revenue = optimal_contract * coeff_values
+            
+            return optimal_contract, optimal_revenue
+            
+        except Exception as e:
+            print(f"等式约束贪心算法失败: {e}")
+            return None, None
+    
     def optimize_contract(self, df):
         """优化原合约使总收入最大（兼容旧接口）"""
         return self.optimize_contract_with_constraint(df)
@@ -348,15 +473,16 @@ class ContractOptimizer:
         # 询问用户输入每日总量限制
         if self.daily_total_limit is None:
             try:
-                limit_input = input(f"\n请输入 {target_date.strftime('%Y年%m月%d日')} 的每日原合约总量限制: ").strip()
+                limit_input = input(f"\n请输入 {target_date.strftime('%Y年%m月%d日')} 的每日原合约总量（必须等于此值）: ").strip()
                 if limit_input:
                     self.daily_total_limit = float(limit_input)
-                    print(f"已设置每日总量限制为: {self.daily_total_limit}")
+                    print(f"已设置每日总量限制为: {self.daily_total_limit} (等式约束)")
                 else:
-                    print("未设置总量限制，将使用无约束优化")
+                    print("错误：必须设置总量限制值")
+                    return None
             except ValueError:
-                print("输入无效，将使用无约束优化")
-                self.daily_total_limit = None
+                print("输入无效，必须输入数值")
+                return None
         
         # 优化原合约
         optimal_contract, optimal_revenue = self.optimize_contract_with_constraint(df)
@@ -368,6 +494,18 @@ class ContractOptimizer:
         date_str = target_date.strftime('%Y-%m-%d')
         self.print_optimal_values(optimal_contract, date_str)
         
+        # 验证总量约束
+        actual_total = optimal_contract.sum()
+        if self.daily_total_limit is not None:
+            print(f"\n约束验证:")
+            print(f"目标总量: {self.daily_total_limit}")
+            print(f"实际总量: {actual_total:.6f}")
+            print(f"差值: {abs(actual_total - self.daily_total_limit):.6f}")
+            if abs(actual_total - self.daily_total_limit) < 1e-6:
+                print("✓ 等式约束满足")
+            else:
+                print("✗ 等式约束不满足")
+        
         # 获取价格列信息
         price_cols = self.find_price_columns(df)
         
@@ -376,7 +514,7 @@ class ContractOptimizer:
             'data': df,
             'optimal_contract': optimal_contract,
             'optimal_revenue': optimal_revenue,
-            'total_optimal_revenue': optimal_revenue.sum(),
+            'total_optimal_revenue': float(optimal_revenue.sum()) if hasattr(optimal_revenue, 'sum') else sum(optimal_revenue),
             'avg_optimal_contract': optimal_contract.mean(),
             'total_contract_amount': optimal_contract.sum(),
             'daily_total_limit': self.daily_total_limit,
@@ -411,7 +549,7 @@ class ContractOptimizer:
         # 添加统计信息
         total_amount = np.sum(optimal_contract)
         avg_contract = np.mean(optimal_contract)
-        limit_info = f"总量限制: {result['daily_total_limit']}" if result['daily_total_limit'] else "无总量限制"
+        limit_info = f"总量限制: {result['daily_total_limit']} (等式约束)" if result['daily_total_limit'] else "无总量限制"
         ax1.text(0.02, 0.98, f'总合约量: {total_amount:.3f}\n平均值: {avg_contract:.3f}\n{limit_info}', 
                 transform=ax1.transAxes, verticalalignment='top',
                 bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
@@ -430,17 +568,17 @@ class ContractOptimizer:
                 transform=ax2.transAxes, verticalalignment='top',
                 bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
         
-        # 3. 价格差分布
+        # 3. 合约收益系数分布
         price_cols = result['price_columns']
         if 'contract_price' in price_cols and 'forward_price' in price_cols:
             contract_prices = pd.to_numeric(result['data'][price_cols['contract_price']], errors='coerce')
             forward_prices = pd.to_numeric(result['data'][price_cols['forward_price']], errors='coerce')
-            price_diff = contract_prices - forward_prices
+            contract_revenue_coeff = contract_prices - forward_prices
             
-            ax3.plot(time_points, price_diff, 'r-', linewidth=2, marker='^', markersize=3)
-            ax3.set_title(f'{date_str} 价格差 (合约电价 - 日前电价)', fontsize=12)
+            ax3.plot(time_points, contract_revenue_coeff, 'r-', linewidth=2, marker='^', markersize=3)
+            ax3.set_title(f'{date_str} 合约收益系数 (合约电价 - 日前电价)', fontsize=12)
             ax3.set_xlabel('时间点 (15分钟间隔)')
-            ax3.set_ylabel('价格差')
+            ax3.set_ylabel('合约收益系数')
             ax3.grid(True, alpha=0.3)
             ax3.set_xticks(range(0, 97, 8))
             ax3.axhline(y=0, color='black', linestyle='--', alpha=0.5)
@@ -468,15 +606,16 @@ class ContractOptimizer:
         # 询问用户输入月度总量限制
         if self.daily_total_limit is None:
             try:
-                limit_input = input(f"\n请输入 {year}年{month}月 每日原合约总量限制: ").strip()
+                limit_input = input(f"\n请输入 {year}年{month}月 每日原合约总量（必须等于此值）: ").strip()
                 if limit_input:
                     self.daily_total_limit = float(limit_input)
-                    print(f"已设置每日总量限制为: {self.daily_total_limit}")
+                    print(f"已设置每日总量限制为: {self.daily_total_limit} (等式约束)")
                 else:
-                    print("未设置总量限制，将使用无约束优化")
+                    print("错误：必须设置总量限制值")
+                    return None
             except ValueError:
-                print("输入无效，将使用无约束优化")
-                self.daily_total_limit = None
+                print("输入无效，必须输入数值")
+                return None
         
         # 获取该月所有日期的数据
         excel_files = [f for f in os.listdir(self.data_dir) if f.endswith('.xlsx')]
@@ -662,7 +801,7 @@ class ContractOptimizer:
         # 添加统计信息
         avg_total = np.sum(monthly_avg)
         avg_value = np.mean(monthly_avg)
-        limit_info = f"每日总量限制: {result['daily_total_limit']}" if result['daily_total_limit'] else "无总量限制"
+        limit_info = f"每日总量限制: {result['daily_total_limit']} (等式约束)" if result['daily_total_limit'] else "无总量限制"
         
         ax1.text(0.02, 0.98, f'平均总合约量: {avg_total:.3f}\n月平均值: {avg_value:.3f}\n处理天数: {result["days_count"]}天\n{limit_info}', 
                 transform=ax1.transAxes, verticalalignment='top',
@@ -687,6 +826,219 @@ class ContractOptimizer:
             print(f"月度图表已保存到: {save_path}")
         
         plt.show()
+
+    def calculate_total_revenue_for_contract(self, df, optimal_contract):
+        """计算指定原合约值下的总收益"""
+        try:
+            # 查找各项收益列
+            revenue_columns = {}
+            
+            for col in df.columns:
+                col_str = str(col).lower()
+                if '撮合收益' in col_str:
+                    revenue_columns['matching_revenue'] = col
+                elif '日前结算收益' in col_str:
+                    revenue_columns['forward_settlement_revenue'] = col
+                elif '实时结算收益' in col_str:
+                    revenue_columns['realtime_settlement_revenue'] = col
+                elif '省间现货收益' in col_str:
+                    revenue_columns['interprovincial_revenue'] = col
+            
+            # 计算合约收益 = 原合约 × 合约电价
+            price_cols = self.find_price_columns(df)
+            if 'contract_price' in price_cols:
+                contract_prices = pd.to_numeric(df[price_cols['contract_price']], errors='coerce').fillna(0)
+                # 合约收益 = 原合约 × 合约电价
+                contract_revenue = optimal_contract * contract_prices
+            else:
+                contract_revenue = pd.Series(0.0, index=range(len(optimal_contract)))
+            
+            # 读取其他固定收益（这些收益不随原合约变化）
+            total_revenue = contract_revenue.copy()
+            
+            for revenue_type, col_name in revenue_columns.items():
+                revenue_values = pd.to_numeric(df[col_name], errors='coerce').fillna(0)
+                # 确保长度一致
+                if len(revenue_values) == len(total_revenue):
+                    total_revenue += revenue_values
+            
+            return total_revenue
+            
+        except Exception as e:
+            print(f"计算总收益时出错: {e}")
+            # 返回只包含合约收益的结果
+            if 'contract_revenue' in locals():
+                return contract_revenue
+            else:
+                return pd.Series(0.0, index=range(len(optimal_contract)))
+
+    def print_detailed_revenue_breakdown(self, df, optimal_contract, optimal_revenue, date_str):
+        """打印每个时间点的详细收益分解"""
+        print(f"\n=== {date_str} 每15分钟详细收益分解 ===")
+        
+        # 查找各项收益列
+        revenue_columns = {}
+        for col in df.columns:
+            col_str = str(col).lower()
+            if '合约收益' in col_str:
+                revenue_columns['contract_revenue'] = col
+            elif '撮合收益' in col_str:
+                revenue_columns['matching_revenue'] = col
+            elif '日前结算收益' in col_str:
+                revenue_columns['forward_settlement_revenue'] = col
+            elif '实时结算收益' in col_str:
+                revenue_columns['realtime_settlement_revenue'] = col
+            elif '省间现货收益' in col_str:
+                revenue_columns['interprovincial_revenue'] = col
+        
+        # 计算优化后的合约收益
+        price_cols = self.find_price_columns(df)
+        if 'contract_price' in price_cols:
+            contract_prices = pd.to_numeric(df[price_cols['contract_price']], errors='coerce').fillna(0)
+            # 合约收益 = 原合约 × 合约电价
+            optimized_contract_revenue = optimal_contract * contract_prices
+        else:
+            optimized_contract_revenue = pd.Series(0.0, index=range(len(optimal_contract)))
+        
+        # 打印表头
+        header = f"{'时间':>6} {'原合约':>8} {'合约收益':>10} {'撮合收益':>10} {'日前结算':>10} {'实时结算':>10} {'省间现货':>10} {'总收入':>10}"
+        print(header)
+        print("=" * len(header))
+        
+        # 逐行打印每个时间点的数据
+        total_sum = {'contract': 0, 'matching': 0, 'forward': 0, 'realtime': 0, 'interprovincial': 0, 'total': 0}
+        
+        for i in range(len(optimal_contract)):
+            # 计算时间（每15分钟一个点）
+            hour = i // 4
+            minute = (i % 4) * 15
+            time_str = f"{hour:02d}:{minute:02d}"
+            
+            # 获取各项收益
+            contract_rev = optimized_contract_revenue.iloc[i] if i < len(optimized_contract_revenue) else 0
+            
+            matching_rev = 0
+            if 'matching_revenue' in revenue_columns and i < len(df):
+                matching_rev = pd.to_numeric(df[revenue_columns['matching_revenue']].iloc[i], errors='coerce')
+                matching_rev = matching_rev if pd.notna(matching_rev) else 0
+            
+            forward_rev = 0
+            if 'forward_settlement_revenue' in revenue_columns and i < len(df):
+                forward_rev = pd.to_numeric(df[revenue_columns['forward_settlement_revenue']].iloc[i], errors='coerce')
+                forward_rev = forward_rev if pd.notna(forward_rev) else 0
+            
+            realtime_rev = 0
+            if 'realtime_settlement_revenue' in revenue_columns and i < len(df):
+                realtime_rev = pd.to_numeric(df[revenue_columns['realtime_settlement_revenue']].iloc[i], errors='coerce')
+                realtime_rev = realtime_rev if pd.notna(realtime_rev) else 0
+            
+            interprovincial_rev = 0
+            if 'interprovincial_revenue' in revenue_columns and i < len(df):
+                interprovincial_rev = pd.to_numeric(df[revenue_columns['interprovincial_revenue']].iloc[i], errors='coerce')
+                interprovincial_rev = interprovincial_rev if pd.notna(interprovincial_rev) else 0
+            
+            # 总收入
+            total_revenue_point = contract_rev + matching_rev + forward_rev + realtime_rev + interprovincial_rev
+            
+            # 打印当前时间点数据
+            print(f"{time_str:>6} {optimal_contract[i]:>8.3f} {contract_rev:>10.2f} {matching_rev:>10.2f} {forward_rev:>10.2f} {realtime_rev:>10.2f} {interprovincial_rev:>10.2f} {total_revenue_point:>10.2f}")
+            
+            # 累加到总计
+            total_sum['contract'] += contract_rev
+            total_sum['matching'] += matching_rev
+            total_sum['forward'] += forward_rev
+            total_sum['realtime'] += realtime_rev
+            total_sum['interprovincial'] += interprovincial_rev
+            total_sum['total'] += total_revenue_point
+        
+        # 打印分割线和总计
+        print("=" * len(header))
+        total_contract = np.sum(optimal_contract)
+        print(f"{'总计':>6} {total_contract:>8.3f} {total_sum['contract']:>10.2f} {total_sum['matching']:>10.2f} {total_sum['forward']:>10.2f} {total_sum['realtime']:>10.2f} {total_sum['interprovincial']:>10.2f} {total_sum['total']:>10.2f}")
+        
+        # 打印收益占比
+        print(f"\n=== 收益构成分析 ===")
+        if total_sum['total'] != 0:
+            print(f"合约收益占比: {total_sum['contract']/total_sum['total']*100:>6.1f}% ({total_sum['contract']:>10.2f})")
+            print(f"撮合收益占比: {total_sum['matching']/total_sum['total']*100:>6.1f}% ({total_sum['matching']:>10.2f})")
+            print(f"日前结算占比: {total_sum['forward']/total_sum['total']*100:>6.1f}% ({total_sum['forward']:>10.2f})")
+            print(f"实时结算占比: {total_sum['realtime']/total_sum['total']*100:>6.1f}% ({total_sum['realtime']:>10.2f})")
+            print(f"省间现货占比: {total_sum['interprovincial']/total_sum['total']*100:>6.1f}% ({total_sum['interprovincial']:>10.2f})")
+        
+        return total_sum
+
+    def print_monthly_revenue_breakdown(self, year, month):
+        """打印月度每日详细收益分解"""
+        print(f"\n=== {year}年{month}月 每日详细收益分解 ===")
+        
+        # 获取该月所有日期的数据
+        excel_files = [f for f in os.listdir(self.data_dir) if f.endswith('.xlsx')]
+        target_files = []
+        
+        for filename in excel_files:
+            date = self.extract_date_from_filename(filename)
+            if date and date.year == year and date.month == month:
+                target_files.append((filename, date))
+        
+        if not target_files:
+            print(f"没有找到 {year}年{month}月 的数据文件")
+            return
+        
+        # 按日期排序
+        target_files.sort(key=lambda x: x[1])
+        
+        monthly_total = {'contract': 0, 'matching': 0, 'forward': 0, 'realtime': 0, 'interprovincial': 0, 'total': 0}
+        
+        for filename, date in target_files:
+            try:
+                filepath = os.path.join(self.data_dir, filename)
+                df = self.load_data(filepath)
+                
+                if df is None or df.empty:
+                    print(f"{date.strftime('%m-%d')}: 数据加载失败")
+                    continue
+                
+                # 优化原合约
+                optimal_contract, optimal_revenue = self.optimize_contract_with_constraint(df)
+                
+                if optimal_contract is None:
+                    print(f"{date.strftime('%m-%d')}: 优化失败")
+                    continue
+                
+                # 打印该日的详细分解
+                date_str = date.strftime('%Y-%m-%d')
+                daily_breakdown = self.print_detailed_revenue_breakdown(df, optimal_contract, optimal_revenue, date_str)
+                
+                # 累加到月度总计
+                for key in monthly_total:
+                    if key in daily_breakdown:
+                        monthly_total[key] += daily_breakdown[key]
+                
+                print()  # 空行分隔
+                
+            except Exception as e:
+                print(f"{date.strftime('%m-%d')}: 处理出错 - {e}")
+                continue
+        
+        # 打印月度汇总
+        print("=" * 80)
+        print(f"=== {year}年{month}月 收益汇总 ===")
+        print(f"合约收益总计: {monthly_total['contract']:,.2f}")
+        print(f"撮合收益总计: {monthly_total['matching']:,.2f}")
+        print(f"日前结算总计: {monthly_total['forward']:,.2f}")
+        print(f"实时结算总计: {monthly_total['realtime']:,.2f}")
+        print(f"省间现货总计: {monthly_total['interprovincial']:,.2f}")
+        print(f"总收入合计: {monthly_total['total']:,.2f}")
+        
+        if monthly_total['total'] != 0:
+            print(f"\n=== 月度收益构成 ===")
+            print(f"合约收益占比: {monthly_total['contract']/monthly_total['total']*100:.1f}%")
+            print(f"撮合收益占比: {monthly_total['matching']/monthly_total['total']*100:.1f}%")
+            print(f"日前结算占比: {monthly_total['forward']/monthly_total['total']*100:.1f}%")
+            print(f"实时结算占比: {monthly_total['realtime']/monthly_total['total']*100:.1f}%")
+            print(f"省间现货占比: {monthly_total['interprovincial']/monthly_total['total']*100:.1f}%")
+        
+        return monthly_total
 
 def main():
     """主函数"""
@@ -718,7 +1070,16 @@ def main():
                 print(f"\n=== {date} 原合约优化分析结果 ===")
                 print(f"平均最优原合约值: {result['avg_optimal_contract']:.3f}")
                 print(f"总最优收益: {result['total_optimal_revenue']:.2f}")
+                print(f"总合约量: {result['total_contract_amount']:.3f}")
                 print(f"原合约取值范围: {result['contract_range']}")
+                
+                # 询问是否显示详细收益分解
+                detail_choice = input("\n是否显示每15分钟详细收益分解? (y/n): ").strip().lower()
+                if detail_choice in ['y', 'yes', '是']:
+                    revenue_breakdown = optimizer.print_detailed_revenue_breakdown(
+                        result['data'], result['optimal_contract'], 
+                        result['optimal_revenue'], date
+                    )
                 
                 plot_choice = input("\n是否绘制分析图表? (y/n): ").strip().lower()
                 if plot_choice in ['y', 'yes', '是']:
@@ -762,6 +1123,14 @@ def main():
                             print(f"月平均总合约量: {np.sum(result['monthly_average']):.3f}")
                             print(f"每日总量限制: {result['daily_total_limit']}")
                         
+                            # 询问是否显示每日详细收益分解
+                            detail_choice = input("\n是否显示每日详细收益分解? (y/n): ").strip().lower()
+                            if detail_choice in ['y', 'yes', '是']:
+                                print("注意：这将显示该月所有天的详细收益，输出较多...")
+                                confirm = input("确认继续? (y/n): ").strip().lower()
+                                if confirm in ['y', 'yes', '是']:
+                                    optimizer.print_monthly_revenue_breakdown(year, month)
+                            
                             plot_choice = input("\n是否绘制月度分析图表? (y/n): ").strip().lower()
                             if plot_choice in ['y', 'yes', '是']:
                                 save_choice = input("是否保存图表? (y/n): ").strip().lower()
