@@ -16,10 +16,44 @@ from collections import defaultdict
 import argparse
 
 class PowerSettlementAnalyzer:
-    def __init__(self, data_dir='.'):
+    def __init__(self, data_dir='2025/'):
         self.data_dir = data_dir
         self.data = {}  # 存储所有数据：{date: negative_sum}
         self.detailed_data = {}  # 存储详细数据：{date: dataframe}
+        
+    def get_month_folder_name(self, month):
+        """根据月份数字获取对应的文件夹名称"""
+        month_names = {
+            1: "1月", 2: "2月", 3: "3月", 4: "4月", 5: "5月", 6: "6月",
+            7: "7月", 8: "8月", 9: "9月", 10: "10月", 11: "11月", 12: "12月"
+        }
+        return month_names.get(month, str(month) + "月")
+    
+    def get_all_excel_files(self):
+        """获取所有Excel文件的路径和文件名"""
+        all_files = []
+        
+        try:
+            # 遍历数据目录中的所有子文件夹
+            for item in os.listdir(self.data_dir):
+                item_path = os.path.join(self.data_dir, item)
+                if os.path.isdir(item_path):
+                    # 在子文件夹中查找Excel文件
+                    try:
+                        for filename in os.listdir(item_path):
+                            if filename.endswith('.xlsx'):
+                                full_path = os.path.join(item_path, filename)
+                                all_files.append((filename, full_path))
+                    except PermissionError:
+                        continue
+                elif item.endswith('.xlsx'):
+                    # 根目录中的Excel文件（向后兼容）
+                    full_path = os.path.join(self.data_dir, item)
+                    all_files.append((item, full_path))
+        except FileNotFoundError:
+            print("数据目录不存在: " + str(self.data_dir))
+        
+        return all_files
         
     def extract_date_from_filename(self, filename):
         """从文件名中提取日期"""
@@ -188,20 +222,20 @@ class PowerSettlementAnalyzer:
                 return None
         
         # 查找对应的Excel文件
-        excel_files = [f for f in os.listdir(self.data_dir) if f.endswith('.xlsx')]
+        all_files = self.get_all_excel_files()
         target_file = None
+        filepath = None
         
-        for filename in excel_files:
+        for filename, full_path in all_files:
             date = self.extract_date_from_filename(filename)
             if date and date == target_date:
                 target_file = filename
+                filepath = full_path
                 break
         
         if target_file is None:
             print(f"未找到 {target_date.strftime('%Y-%m-%d')} 的数据文件")
             return None
-        
-        filepath = os.path.join(self.data_dir, target_file)
         df = self.load_detailed_data(filepath)
         
         if df is None:
@@ -250,16 +284,15 @@ class PowerSettlementAnalyzer:
     def load_all_data(self):
         """加载所有Excel文件数据"""
         print("正在加载数据...")
-        excel_files = [f for f in os.listdir(self.data_dir) if f.endswith('.xlsx')]
+        excel_files = self.get_all_excel_files()
         
-        for filename in excel_files:
+        for filename, full_path in excel_files:
             date = self.extract_date_from_filename(filename)
             if date is None:
                 print(f"无法从文件名 {filename} 中提取日期")
                 continue
             
-            filepath = os.path.join(self.data_dir, filename)
-            negative_sum = self.process_excel_file(filepath)
+            negative_sum = self.process_excel_file(full_path)
             
             if negative_sum is not None:
                 self.data[date] = negative_sum
